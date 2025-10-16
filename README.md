@@ -27,6 +27,12 @@ During the run the script writes:
 - `best_combo.parquet`: overwritten after each improvement and contains only the current best combined alpha values.
 - `figures/best_combo.png` (or your custom path): overwritten with the IC / `lw_ic_v2` traces of the strongest combo so far.
 
+### Evaluation rules
+
+- The loader enforces a unique `(pred_date, code)` index by dropping duplicate rows while preserving the first occurrence, avoiding downstream alignment issues.
+- Each candidate variant is analysed through `examine_featuretocsv3.analyze`.  If the reported IC is negative, the series is flipped and the metrics are recomputed on the inverted signal.
+- Only variants with a **positive** IC of at least `0.004` are considered for combination.  Qualified candidates are then tested with weights `2.0`, `1.0`, `0.5`, and `0.1` (interpreted as linear coefficients relative to the original orientation).
+
 ## Uploading results to GitHub
 
 The container environment does not automatically push to GitHub.  To publish your work:

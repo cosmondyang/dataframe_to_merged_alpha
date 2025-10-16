@@ -107,9 +107,14 @@ def _ensure_multi_index(df: pd.DataFrame) -> pd.DataFrame:
         "pred_date",
         "code",
     }:
-        return df
+        out = df.sort_index()
+        if not out.index.is_unique:
+            out = out[~out.index.duplicated(keep="first")]
+        return out
     if {"pred_date", "code"}.issubset(df.columns):
         out = df.set_index(["pred_date", "code"]).sort_index()
+        if not out.index.is_unique:
+            out = out[~out.index.duplicated(keep="first")]
         return out
     raise ValueError(
         "DataFrame must either have a MultiIndex (pred_date, code) or explicit columns."
@@ -126,6 +131,19 @@ def _cs_apply(series: pd.Series, func) -> pd.Series:
 
 def _demean(series: pd.Series) -> pd.Series:
     return series - _cs_apply(series, "mean")
+
+
+def _align_series_pair(a: pd.Series, b: pd.Series) -> Tuple[pd.Series, pd.Series]:
+    a = a.sort_index()
+    b = b.sort_index()
+    if a.index.equals(b.index):
+        return a, b
+    common = a.index.intersection(b.index)
+    if len(common) == 0:
+        raise ValueError("Series do not share any index entries for alignment.")
+    a_aligned = a.loc[common]
+    b_aligned = b.loc[common]
+    return a_aligned, b_aligned
 
 
 def _normalize_long_short(series: pd.Series) -> pd.Series:
@@ -434,6 +452,7 @@ class OperatorLibrary:
     def _apply_same_family(
         self, a: pd.Series, b: pd.Series, op: str
     ) -> pd.Series:
+        a, b = _align_series_pair(a, b)
         if op == "add":
             return a + b
         if op == "divide":
@@ -461,6 +480,7 @@ class OperatorLibrary:
     def _apply_cross_family(
         self, a: pd.Series, b: pd.Series, op: str
     ) -> pd.Series:
+        a, b = _align_series_pair(a, b)
         if op == "multiply":
             return a * b
         if op == "zscore_sum":
@@ -557,6 +577,7 @@ class OperatorLibrary:
     def apply_binary(
         self, lhs: pd.Series, rhs: pd.Series, op: str
     ) -> Tuple[pd.Series, BinaryStep]:
+        lhs, rhs = _align_series_pair(lhs, rhs)
         if op == "rank_ratio":
             rl = lhs.groupby(level="pred_date").transform(_safe_rank)
             rr = rhs.groupby(level="pred_date").transform(_safe_rank)
@@ -846,7 +867,9 @@ class AlphaComboManager:
         structure: AlphaStructure,
         base_metrics: Dict[str, MetricResult],
     ) -> None:
+        structure_dict = self._structure_to_dict(structure)
         for variant_key, variant_series in variants.items():
+            variant_series = variant_series.sort_index()
             metrics = base_metrics.get(variant_key)
             if metrics is None:
                 metrics = self.metric_book.evaluate(
@@ -855,19 +878,23 @@ class AlphaComboManager:
                 base_metrics[variant_key] = metrics
             if pd.isna(metrics.ic) or pd.isna(metrics.lw_ic_v2):
                 continue
-            ic_val = metrics.ic
-            if abs(ic_val) < 0.004:
+            working_series = variant_series
+            working_metrics = metrics
+            flipped = False
+            if working_metrics.ic < 0:
+                working_series = (-variant_series).sort_index()
+                working_metrics = self.metric_book.evaluate(
+                    working_series, label=f"{candidate_name}_{variant_key}_flipped"
+                )
+                flipped = True
+            if (
+                pd.isna(working_metrics.ic)
+                or pd.isna(working_metrics.lw_ic_v2)
+                or working_metrics.ic < 0.004
+            ):
                 continue
-            direction = 1.0
-            if ic_val < 0:
-                direction = -1.0
-            adjusted_series = variant_series * direction
-            adjusted_metrics = MetricResult(
-                ic=metrics.ic * direction,
-                lw_ic_v2=metrics.lw_ic_v2 * direction,
-            )
             for weight in (2.0, 1.0, 0.5, 0.1):
-                combined_series = self._combine_series(adjusted_series, weight)
+                combined_series = self._combine_series(working_series, weight)
                 combined_metrics = self.metric_book.evaluate(
                     combined_series, label="combo"
                 )
@@ -876,8 +903,8 @@ class AlphaComboManager:
                     self.entries.append(
                         ComboEntry(
                             name=f"{candidate_name}:{variant_key}",
-                            weight=weight * direction,
-                            description=self._structure_to_dict(structure),
+                            weight=weight if not flipped else -weight,
+                            description=structure_dict,
                         )
                     )
                     self.combo_metrics = combined_metrics
@@ -885,17 +912,26 @@ class AlphaComboManager:
                     self._log_success(
                         candidate_name,
                         variant_key,
-                        weight * direction,
+                        weight if not flipped else -weight,
                         combined_metrics,
-                        adjusted_metrics,
+                        working_metrics,
+                        flipped,
+                        structure_dict,
                     )
                     self._persist_combo()
                     break
 
     def _combine_series(self, series: pd.Series, weight: float) -> pd.Series:
+        series = series.sort_index() * weight
         if self.combo_series is None:
-            return series * weight
-        return self.combo_series + series * weight
+            return series
+        combo = self.combo_series.sort_index()
+        df = pd.concat(
+            [combo.rename("combo"), series.rename("candidate")], axis=1
+        )
+        combined = df.sum(axis=1, min_count=1)
+        combined.name = "alpha_combo"
+        return combined
 
     def _is_improvement(self, metrics: MetricResult) -> bool:
         if pd.isna(metrics.ic) or pd.isna(metrics.lw_ic_v2):
@@ -916,13 +952,15 @@ class AlphaComboManager:
         weight: float,
         new_metrics: MetricResult,
         variant_metrics: MetricResult,
+        flipped: bool,
+        structure: Dict[str, object],
     ) -> None:
         os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
-        structure = next((e.description for e in self.entries if e.name == f"{candidate_name}:{variant_key}"), None)
         payload = {
             "candidate": candidate_name,
             "variant": variant_key,
             "weight": weight,
+            "flipped": flipped,
             "variant_metrics": dataclasses.asdict(variant_metrics),
             "combo_metrics": dataclasses.asdict(new_metrics),
             "structure": structure,
@@ -1008,6 +1046,7 @@ class AlphaBuilder:
                 continue
 
             use_unary = (not unary_used) and (random.random() < 0.3)
+            current, comp_series = _align_series_pair(current, comp_series)
             if use_unary:
                 op = random.choice(self.oplib.UNARY_OPS)
                 current, unary_step = self.oplib.apply_unary(current, op)
@@ -1022,6 +1061,7 @@ class AlphaBuilder:
         if current is None:
             raise RuntimeError("Failed to build alpha – no composites generated.")
 
+        current = current.sort_index()
         structure = AlphaStructure(
             depth=depth,
             composite_steps=composite_steps,
