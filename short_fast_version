@@ -1,0 +1,560 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+combo_fastgenerator_memsafe.py
+
+- 内存友好：Lazy 按需生成 f0/csmean/ffill（可选 csmin/csmax），LRU 缓存；不 panelize
+- 滚动核：按 code 分组的累计和实现，支持稀疏面板
+- 复合规则：五大类；跨类仅 {mul, zscore_sum, zscore_product, demean_norm_sum}；
+  同类 50% 概率 delay(b), lag∈{1,2,3}，允许 {add, sub, mul, div, zscore_sum, zscore_product, demean_norm_sum}
+- 三分布：raw/rank/gaussian → demean → 多空绝对值和各自归一（∑|long|=∑|short|=1）
+- touchstone_T 默认为 1；时间日志写 ./time_tracking.txt
+"""
+
+from __future__ import annotations
+import argparse, os, json, math, random, time
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+import pandas as pd
+
+# -------- external metric ----------
+from examine_featuretocsv3 import analyze, safe_get_dates
+
+# ================= timing =================
+TIME_LOG_PATH = "./time_tracking.txt"
+def _log(msg: str) -> None:
+    print(msg, flush=True)
+    try:
+        with open(TIME_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(msg + "\n")
+    except Exception:
+        pass
+
+class timeit:
+    def __init__(self, label: str, **kv):
+        self.label=label; self.kv=kv
+    def __enter__(self):
+        ts=datetime.now().isoformat(timespec="seconds")
+        extra=(" " + " ".join(f"{k}={v}" for k,v in self.kv.items())) if self.kv else ""
+        _log(f"[{ts}] START {self.label}{extra}")
+        self.t0=time.perf_counter()
+    def __exit__(self, exc_type, exc, tb):
+        dt=time.perf_counter()-self.t0
+        ts=datetime.now().isoformat(timespec="seconds")
+        _log(f"[{ts}] END   {self.label} | {dt:.6f}s")
+
+# ================= utils & const =================
+EPS = 1e-8
+DEFAULT_PARQUET = "/remote-home/yyc/gen_ocall_features_demo_v02/saved_features/fiveclass30sfeature2.parquet"
+VALID_FILLS = {"f0", "csmean", "ffill", "csmin", "csmax"}
+
+def ensure_mi(df: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(df.index, pd.MultiIndex) and set(df.index.names) >= {"pred_date","code"}:
+        out=df.sort_index()
+        if not out.index.is_unique:
+            out=out[~out.index.duplicated(keep="first")]
+        if out.index.nlevels>2:
+            out.index=out.index.set_names(["pred_date","code"]+list(out.index.names[2:]))
+        return out
+    if {"pred_date","code"}.issubset(df.columns):
+        out=df.set_index(["pred_date","code"]).sort_index()
+        if not out.index.is_unique:
+            out=out[~out.index.duplicated(keep="first")]
+        return out
+    raise ValueError("Expect MultiIndex (pred_date, code) or explicit columns.")
+
+def factorize_dates(mi: pd.MultiIndex)->np.ndarray:
+    return pd.factorize(mi.get_level_values("pred_date"), sort=True)[0].astype(np.int32, copy=False)
+
+# ============== group helpers (per-date & per-code) ==============
+def rank_pct_by_gid(values: np.ndarray, gid: np.ndarray, n_groups:int)->np.ndarray:
+    out = np.empty_like(values, dtype=np.float32)
+    for g in range(n_groups):
+        idx = (gid==g)
+        if not np.any(idx): 
+            continue
+        v = values[idx]
+        order = np.argsort(v, kind="mergesort")  # 稳定
+        r = np.empty_like(order, dtype=np.float32)
+        r[order] = np.arange(1, v.size+1, dtype=np.float32)
+        out[idx] = r / (v.size + 1.0)
+    return out
+
+def gaussian_from_u(u: np.ndarray)->np.ndarray:
+    a = 0.147
+    x = 2*np.clip(u, EPS, 1-EPS) - 1
+    sign = np.sign(x)
+    ln = np.log(1 - x*x)
+    part = (2/(math.pi*a)) + (ln/2)
+    inside = part*part - ln/a
+    z = math.sqrt(2.0) * (sign*np.sqrt(np.sqrt(inside) - part))
+    return z.astype(np.float32, copy=False)
+
+def fast_demean(v: np.ndarray, gid: np.ndarray, n_groups:int)->np.ndarray:
+    sums = np.bincount(gid, weights=v, minlength=n_groups)
+    cnts = np.bincount(gid, minlength=n_groups)
+    means = sums / np.maximum(cnts, 1.0)
+    return v - means[gid]
+
+def fast_norm_ls(v_dm: np.ndarray, gid: np.ndarray, n_groups:int)->np.ndarray:
+    pos = v_dm > 0; neg = v_dm < 0
+    sp = np.bincount(gid, weights=np.where(pos, np.abs(v_dm), 0.0), minlength=n_groups)
+    sn = np.bincount(gid, weights=np.where(neg, np.abs(v_dm), 0.0), minlength=n_groups)
+    out = np.zeros_like(v_dm, dtype=np.float64)
+    dp = sp[gid] + EPS; dn = sn[gid] + EPS
+    out[pos] = v_dm[pos] / dp[pos]
+    out[neg] = v_dm[neg] / dn[neg]
+    return out
+
+def code_position_map(mi: pd.MultiIndex) -> Dict[object, np.ndarray]:
+    """构建 code -> 全局位置索引 的映射（每个 code 的索引按 pred_date 升序）"""
+    with timeit("build.code_position_map"):
+        # 用 RangeIndex groupby 一次性得到每个 code 的位置 np.ndarray（int64）
+        pos = pd.Series(np.arange(len(mi), dtype=np.int64), index=mi)
+        mapping: Dict[object, np.ndarray] = {}
+        for code, grp in pos.groupby(level="code", sort=False):
+            arr = grp.values  # numpy int64
+            # 保证升序（一般已经是升序，因为 MultiIndex 是按 date 再 code；这里保险起见）
+            if arr.size>1 and (arr[1]<arr[0]):
+                arr = np.sort(arr)
+            mapping[code] = arr
+        return mapping
+
+def shift_by_code(s: pd.Series, lag:int, code2pos:Dict[object,np.ndarray]) -> pd.Series:
+    v = s.to_numpy(copy=False).astype(np.float32, copy=False)
+    out = v.copy()
+    for _, idx in code2pos.items():
+        if lag >= len(idx):
+            out[idx] = 0.0
+        else:
+            out[idx[lag:]] = v[idx[:-lag]]
+            out[idx[:lag]] = 0.0
+    return pd.Series(out, index=s.index, name=s.name)
+
+def rolling_mean_std_series(s: pd.Series, window:int, code2pos:Dict[object,np.ndarray]) -> Tuple[np.ndarray,np.ndarray]:
+    v = s.to_numpy(copy=False).astype(np.float64, copy=False)
+    m = np.empty_like(v); st = np.empty_like(v)
+    for _, idx in code2pos.items():
+        x = v[idx]
+        cs = np.cumsum(x); cs2 = np.cumsum(x*x)
+        k = np.minimum(np.arange(1, len(idx)+1), window).astype(np.float64)
+        sumx = cs.copy(); sumx[window:] = cs[window:] - cs[:-window]
+        sumx2 = cs2.copy(); sumx2[window:] = cs2[window:] - cs2[:-window]
+        mean = sumx / k
+        var  = np.maximum(sumx2 / k - mean*mean, 0.0)
+        m[idx] = mean; st[idx] = np.sqrt(var + EPS)
+    return m.astype(np.float32), st.astype(np.float32)
+
+def rolling_corr_series(a: pd.Series, b: pd.Series, window:int, code2pos:Dict[object,np.ndarray]) -> np.ndarray:
+    va = a.to_numpy(copy=False).astype(np.float64, copy=False)
+    vb = b.to_numpy(copy=False).astype(np.float64, copy=False)
+    out = np.empty_like(va, dtype=np.float32)
+    for _, idx in code2pos.items():
+        x = va[idx]; y = vb[idx]
+        csx = np.cumsum(x); csy = np.cumsum(y)
+        csx2= np.cumsum(x*x); csy2= np.cumsum(y*y)
+        csxy= np.cumsum(x*y)
+        k = np.minimum(np.arange(1, len(idx)+1), window).astype(np.float64)
+        def win(cs):
+            w=cs.copy(); w[window:]=cs[window:]-cs[:-window]; return w
+        Sx, Sy = win(csx), win(csy)
+        Sx2, Sy2, Sxy = win(csx2), win(csy2), win(csxy)
+        mx, my = Sx/k, Sy/k
+        cov = Sxy/k - mx*my
+        vx  = np.maximum(Sx2/k - mx*mx, 0.0)
+        vy  = np.maximum(Sy2/k - my*my, 0.0)
+        out[idx] = (cov / (np.sqrt(vx*vy) + EPS)).astype(np.float32)
+    return out
+
+def rolling_ols_pair_series(y: pd.Series, x: pd.Series, window:int, which:str, code2pos:Dict[object,np.ndarray]) -> np.ndarray:
+    vy = y.to_numpy(copy=False).astype(np.float64, copy=False)
+    vx = x.to_numpy(copy=False).astype(np.float64, copy=False)
+    out = np.empty_like(vy, dtype=np.float32)
+    for _, idx in code2pos.items():
+        yy = vy[idx]; xx = vx[idx]
+        csy = np.cumsum(yy); csx = np.cumsum(xx)
+        csy2= np.cumsum(yy*yy); csx2= np.cumsum(xx*xx)
+        csxy= np.cumsum(xx*yy)
+        k = np.minimum(np.arange(1, len(idx)+1), window).astype(np.float64)
+        def win(cs):
+            w=cs.copy(); w[window:]=cs[window:]-cs[:-window]; return w
+        Sy,Sx = win(csy), win(csx)
+        Sy2,Sx2,Sxy = win(csy2), win(csx2), win(csxy)
+        my,mx = Sy/k, Sx/k
+        cov = Sxy/k - mx*my
+        varx= np.maximum(Sx2/k - mx*mx, 0.0)
+        slope = cov / (varx + EPS)
+        inter = my - slope*mx
+        if which=="slope": res = slope
+        elif which=="intercept": res = inter
+        else:
+            # rmse
+            # mse ≈ var(y) - 2*slope*cov(x,y) + slope^2 * var(x)
+            Sy2_win = Sy2
+            var_y = np.maximum(Sy2_win/k - my*my, 0.0)
+            mse = np.maximum(var_y - 2*slope*cov + (slope**2)*varx, 0.0)
+            res = np.sqrt(mse + EPS)
+        out[idx] = res.astype(np.float32)
+    return out
+
+# ============== dist engine (raw/rank/gaussian -> normalize LS=1) ==============
+class DistEngine:
+    def __init__(self, gid: np.ndarray, n_groups:int, dtype:str="float32"):
+        self.gid=gid; self.n=n_groups; self.dtype=dtype
+    def __call__(self, s: pd.Series) -> Dict[str,pd.Series]:
+        v = s.to_numpy(copy=False).astype(self.dtype, copy=False)
+        # raw
+        dm = fast_demean(v, self.gid, self.n)
+        n1 = fast_norm_ls(dm, self.gid, self.n)
+        out_raw = pd.Series(n1.astype(self.dtype, copy=False), index=s.index)
+        # rank
+        r = rank_pct_by_gid(v, self.gid, self.n)
+        dm = fast_demean(r, self.gid, self.n)
+        n1 = fast_norm_ls(dm, self.gid, self.n)
+        out_rank = pd.Series(n1.astype(self.dtype, copy=False), index=s.index)
+        # gaussian
+        g = gaussian_from_u(r)
+        dm = fast_demean(g, self.gid, self.n)
+        n1 = fast_norm_ls(dm, self.gid, self.n)
+        out_g = pd.Series(n1.astype(self.dtype, copy=False), index=s.index)
+        return {"raw_norm1": out_raw, "rank_norm1": out_rank, "gaussian_norm1": out_g}
+
+# ============== lazy fill (LRU) ==============
+class FillLRU:
+    """按需生成 f0/csmean/ffill/csmin/csmax（默认只用 f0/csmean/ffill），缓存列级结果"""
+    def __init__(self, df: pd.DataFrame, dtype:str="float32", max_items:int=256):
+        self.df = ensure_mi(df)
+        self.dtype = dtype
+        self.cache: Dict[Tuple[str,str], pd.Series] = {}
+        self.order: List[Tuple[str,str]] = []
+        self.max_items = max_items
+
+    def _push(self, key:Tuple[str,str], val:pd.Series)->pd.Series:
+        self.cache[key] = val
+        self.order.append(key)
+        if len(self.cache) > self.max_items:
+            old = self.order.pop(0)
+            self.cache.pop(old, None)
+        return val
+
+    def get(self, col:str, kind:str)->pd.Series:
+        key = (col, kind)
+        if key in self.cache:
+            # refresh
+            self.order.remove(key)
+            self.order.append(key)
+            return self.cache[key]
+        s = self.df[col].astype(self.dtype, copy=False)
+        if kind=="f0":
+            return self._push(key, s.fillna(0.0))
+        if kind=="csmean":
+            m = s.groupby(level="pred_date").transform("mean")
+            return self._push(key, s.fillna(m).fillna(0.0).astype(self.dtype, copy=False))
+        if kind=="ffill":
+            return self._push(key, s.groupby(level="code").ffill().fillna(0.0).astype(self.dtype, copy=False))
+        if kind=="csmin":
+            m = s.groupby(level="pred_date").transform("min")
+            return self._push(key, s.fillna(m).fillna(0.0).astype(self.dtype, copy=False))
+        if kind=="csmax":
+            m = s.groupby(level="pred_date").transform("max")
+            return self._push(key, s.fillna(m).fillna(0.0).astype(self.dtype, copy=False))
+        raise ValueError(f"unknown fill kind: {kind}")
+
+# ============== Workspace（家族 + 采样池） ==============
+class Workspace:
+    def __init__(self, df: pd.DataFrame, rng: Optional[random.Random]=None,
+                 fills: List[str]=None, lru_items:int=256, dtype:str="float32"):
+        self.df = ensure_mi(df).sort_index()
+        self.dtype = dtype
+        self.rng = rng or random.Random()
+        self.index = self.df.index
+        # date groups
+        self.gid = factorize_dates(self.index)
+        self.n_groups = int(self.gid.max()) + 1 if len(self.gid)>0 else 0
+        # code -> positions（一次性建）
+        self.code2pos = code_position_map(self.index)
+        # family buckets
+        fam = {"corr_ratio":[], "count":[], "volume":[], "price":[], "time":[]}
+        for c in self.df.columns:
+            p = c.split("_")[0].lower()
+            if p.startswith("corr") or p.startswith("ratio"): fam["corr_ratio"].append(c)
+            elif p.startswith("count"): fam["count"].append(c)
+            elif p.startswith("volume"): fam["volume"].append(c)
+            elif p.startswith("price"): fam["price"].append(c)
+            elif p.startswith("time"): fam["time"].append(c)
+            else: fam["count"].append(c)  # 兜底
+        self.families = {k:v for k,v in fam.items() if v}
+        # fills
+        self.fills = fills or ["f0","csmean","ffill"]
+        # LRU cache
+        self.lru = FillLRU(self.df, dtype=dtype, max_items=lru_items)
+
+    def random_family(self, exclude: Optional[str]=None)->str:
+        keys=[k for k in self.families if k!=exclude]
+        return self.rng.choice(keys)
+
+    def sample_feature(self, family:str)->Tuple[pd.Series, str]:
+        col = self.rng.choice(self.families[family])
+        kind = self.rng.choice(self.fills)
+        s = self.lru.get(col, kind)
+        s = s.astype(self.dtype, copy=False)
+        s.name = f"{col}__{kind}"
+        return s, s.name
+
+# ============== Operator（同/跨类 + delay(b) 规则） ==============
+@dataclass
+class CompStep:
+    description: str
+    families: Tuple[str,str]
+    sources: Tuple[str,str]
+    operator: str
+
+class Oplib:
+    SAME_NO_DELAY = ("add","sub","mul","div","zsum","zprod","dnormsum")
+    SAME_WITH_DELAY = ("add","sub","mul","div","zsum","zprod","dnormsum")
+    CROSS_ONLY = ("mul","zsum","zprod","dnormsum")
+    def __init__(self, ws: Workspace, rng: Optional[random.Random]=None):
+        self.ws=ws; self.rng=rng or random.Random()
+
+    def set_rng(self, rng: random.Random): self.rng=rng
+
+    def _cs_z(self, v: np.ndarray)->np.ndarray:
+        gid=self.ws.gid; n=self.ws.n_groups
+        sums=np.bincount(gid, weights=v, minlength=n); cnt=np.bincount(gid, minlength=n)
+        mean=sums/np.maximum(cnt,1.0); dm=v-mean[gid]
+        vv=np.bincount(gid, weights=dm*dm, minlength=n)/np.maximum(cnt,1.0)
+        std=np.sqrt(np.maximum(vv, EPS))[gid]
+        return dm/(std+EPS)
+
+    def _dnormsum(self, a: np.ndarray, b: np.ndarray)->np.ndarray:
+        gid=self.ws.gid; n=self.ws.n_groups
+        na=fast_norm_ls(fast_demean(a,gid,n), gid, n)
+        nb=fast_norm_ls(fast_demean(b,gid,n), gid, n)
+        return na + nb
+
+    def random_composite(self)->Tuple[pd.Series, CompStep]:
+        fam_a = self.ws.random_family()
+        # 跨类 or 同类
+        if self.rng.random() < 0.5 and len(self.ws.families)>=2:
+            fam_b = self.ws.random_family(exclude=fam_a)
+            sa, na = self.ws.sample_feature(fam_a)
+            sb, nb = self.ws.sample_feature(fam_b)
+            op = self.rng.choice(self.CROSS_ONLY)
+            out = self._apply(sa, sb, op, delay=None)
+            step = CompStep(description=f"cross({fam_a},{fam_b})", families=(fam_a,fam_b),
+                            sources=(na, nb), operator=op)
+            return out, step
+        else:
+            fam_b = fam_a
+            sa, na = self.ws.sample_feature(fam_a)
+            sb, nb = self.ws.sample_feature(fam_b)
+            use_delay = (self.rng.random()<0.5)
+            delay = None
+            if use_delay:
+                lag = self.rng.randint(1,3)
+                sb = shift_by_code(sb, lag, self.ws.code2pos)
+                delay = lag
+                op = self.rng.choice(self.SAME_WITH_DELAY)
+            else:
+                op = self.rng.choice(self.SAME_NO_DELAY)
+            out = self._apply(sa, sb, op, delay=delay)
+            desc = f"same({fam_a})" if delay is None else f"same({fam_a})_delay{delay}"
+            step = CompStep(description=desc, families=(fam_a,fam_b),
+                            sources=(na, nb if delay is None else f"{nb}__delay{delay}"),
+                            operator=op)
+            return out, step
+
+    def _apply(self, a: pd.Series, b: pd.Series, op: str, delay: Optional[int]) -> pd.Series:
+        av = a.to_numpy(copy=False).astype(np.float32, copy=False)
+        bv = b.to_numpy(copy=False).astype(np.float32, copy=False)
+        if op=="add": out = av + bv
+        elif op=="sub": out = av - bv
+        elif op=="mul": out = av * bv
+        elif op=="div": out = av / (bv + EPS)
+        elif op=="zsum": out = self._cs_z(av) + self._cs_z(bv)
+        elif op=="zprod": out = self._cs_z(av) * self._cs_z(bv)
+        elif op=="dnormsum": out = self._dnormsum(av, bv)
+        else: raise ValueError(op)
+        return pd.Series(out.astype(np.float32, copy=False), index=a.index, name=f"{a.name}_{op}_{b.name}")
+
+# ============== Distribution, Metrics, Combo ==============
+class Distributions:
+    def __init__(self, ws: Workspace, dtype:str="float32"):
+        self.engine = DistEngine(ws.gid, ws.n_groups, dtype=dtype)
+    def __call__(self, s: pd.Series)->Dict[str,pd.Series]:
+        return self.engine(s)
+
+@dataclass
+class MetricResult:
+    ic: float
+    lw_ic_v2: float
+    raw: Optional[Dict[str,object]] = None
+
+class MetricBook:
+    def __init__(self, state:str="core", T:int=1):
+        self.state=state; self.T=T
+    def evaluate(self, series: pd.Series, label:str)->MetricResult:
+        df = series.astype("float64", copy=False).to_frame(name=label)
+        def _zs(col: pd.Series)->pd.Series:
+            m = col.mean(); sd = col.std(ddof=0)
+            if not np.isfinite(sd) or sd==0: return pd.Series(0.0, index=col.index)
+            return (col-m)/(sd+EPS)
+        dfz = df.groupby(level="pred_date").transform(_zs)
+        with timeit("metric.analyze", label=label, state=self.state, T=self.T):
+            try:
+                res = analyze(dfz, state=self.state, T=self.T)
+            except Exception as e:
+                _log(f"[analyze] fail for {label}: {e}")
+                return MetricResult(ic=np.nan, lw_ic_v2=np.nan)
+        ic = float(np.nanmean(np.asarray(res.get("ic", []), dtype="float64"))) if res else np.nan
+        lw = float(np.nanmean(np.asarray(res.get("lw_ic_v2", []), dtype="float64"))) if res else np.nan
+        return MetricResult(ic=ic, lw_ic_v2=lw, raw=res)
+
+class ComboManager:
+    def __init__(self, metric_book: MetricBook, log_path:str, out_parquet:str):
+        self.mb = metric_book
+        self.log_path = log_path
+        self.out_parquet = out_parquet
+        self.combo: Optional[pd.Series] = None
+        self.metrics = MetricResult(ic=0.0, lw_ic_v2=0.0)
+
+    def _ok(self, m:MetricResult)->bool:
+        return m and np.isfinite(m.ic) and np.isfinite(m.lw_ic_v2)
+
+    def _normalize_combo(self, s: pd.Series)->pd.Series:
+        gid = factorize_dates(s.index); n = int(gid.max())+1 if len(gid)>0 else 0
+        v = s.to_numpy(copy=False)
+        dm = fast_demean(v, gid, n); out = fast_norm_ls(dm, gid, n)
+        return pd.Series(out.astype(s.dtype, copy=False), index=s.index, name="alpha_combo")
+
+    def _improve(self, new: MetricResult)->bool:
+        if pd.isna(new.ic) or pd.isna(new.lw_ic_v2): return False
+        if new.ic < self.metrics.ic - EPS: return False
+        if new.lw_ic_v2 < self.metrics.lw_ic_v2 - EPS: return False
+        delta = (new.ic + new.lw_ic_v2) - (self.metrics.ic + self.metrics.lw_ic_v2)
+        return delta > 5e-4
+
+    def attempt_add(self, name:str, variants:Dict[str,pd.Series], structure:Dict[str,object])->None:
+        with timeit("combo.attempt_add", candidate=name, n_variants=len(variants)):
+            for vkey, vs in variants.items():
+                with timeit("combo.evaluate_variant", variant=vkey):
+                    m = self.mb.evaluate(vs.sort_index(), label=f"{name}_{vkey}")
+                    if not self._ok(m): continue
+                working = vs if m.ic >= 0 else (-vs)
+                wm = self.mb.evaluate(working, label=f"{name}_{vkey}{'_flipped' if m.ic < 0 else ''}")
+                if not self._ok(wm) or abs(wm.ic) < 0.004: 
+                    continue
+                for w in (2.0, 1.0, 0.5, 0.1):
+                    with timeit("combo.try_weight", variant=vkey, weight=w):
+                        cand = working.sort_index() * w
+                        combined = cand if self.combo is None else (self.combo + cand)
+                        combined = self._normalize_combo(combined.fillna(0.0))
+                        cm = self.mb.evaluate(combined, label="combo")
+                        if not self._ok(cm): 
+                            continue
+                        if self._improve(cm):
+                            self.combo = combined
+                            self.metrics = cm
+                            os.makedirs(os.path.dirname(self.out_parquet) or ".", exist_ok=True)
+                            combined.rename("alpha_combo").to_frame().to_parquet(self.out_parquet)
+                            with open(self.log_path, "a", encoding="utf-8") as fp:
+                                fp.write(json.dumps({
+                                    "candidate": f"{name}:{vkey}",
+                                    "weight": w if m.ic >= 0 else -w,
+                                    "after": {"ic": cm.ic, "lw": cm.lw_ic_v2},
+                                    "structure": structure
+                                }, ensure_ascii=False) + "\n")
+                            break
+
+# ============== Builder（深度 1–2，同/跨类规则） ==============
+class Builder:
+    def __init__(self, ws: Workspace, op: Oplib, rng: Optional[random.Random]=None):
+        self.ws=ws; self.op=op; self.rng=rng or random.Random()
+    def set_rng(self, rng: random.Random): self.rng=rng
+    def build(self)->Tuple[pd.Series, Dict[str,object]]:
+        with timeit("alpha.build"):
+            depth = self.rng.randint(1, 2)
+            current: Optional[pd.Series] = None
+            comps: List[Dict[str,object]] = []
+            for _ in range(depth):
+                s, step = self.op.random_composite()
+                comps.append(step.__dict__)
+                if current is None: current = s
+                else: current = current + s  # 二元融合使用 add（快）
+            if not current.index.equals(self.ws.index):
+                current = current.reindex(self.ws.index, fill_value=0.0)
+            current = current.fillna(0.0).astype("float32", copy=False)
+            return current, {"depth":depth, "composites":comps, "unary":[], "binary":[]}
+
+# ============== Driver ==============
+def run(df: pd.DataFrame, iterations:int, seed: Optional[int],
+        log_path: str, out_parquet: str, touchstone_state: str, touchstone_T: int,
+        fills: List[str], lru_items:int):
+    if seed is not None:
+        random.seed(seed); np.random.seed(seed)
+    base_rng = random.Random(seed) if seed is not None else random.Random()
+
+    with timeit("search.setup"):
+        ws = Workspace(df, rng=base_rng, fills=fills, lru_items=lru_items, dtype="float32")
+        op = Oplib(ws, rng=base_rng)
+        builder = Builder(ws, op, rng=base_rng)
+        dist = Distributions(ws, dtype="float32")
+        metrics = MetricBook(state=touchstone_state, T=touchstone_T)
+        combo = ComboManager(metrics, log_path=log_path, out_parquet=out_parquet)
+
+    for it in range(1, iterations+1):
+        with timeit("iteration", i=it):
+            local_rng = random.Random(base_rng.getrandbits(63))
+            ws.rng = local_rng; op.set_rng(local_rng); builder.set_rng(local_rng)
+            with timeit("iteration.build", i=it):
+                series, structure = builder.build()
+            with timeit("iteration.distribution", i=it):
+                variants = dist(series)
+            with timeit("iteration.attempt_add", i=it, n_variants=len(variants)):
+                combo.attempt_add(f"alpha_{it:05d}", variants, structure)
+
+# ============== CLI ==============
+def parse_args(argv: Optional[Sequence[str]]=None)->argparse.Namespace:
+    p = argparse.ArgumentParser("Memory-safe fast alpha combo generator (family-aware, lazy fills)")
+    p.add_argument("--parquet-path", default=DEFAULT_PARQUET)
+    p.add_argument("--iterations", type=int, default=200)
+    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--log-path", default="combo_progress.txt")
+    p.add_argument("--combo-parquet", default="best_combo.parquet")
+    p.add_argument("--touchstone-state", default="core")
+    p.add_argument("--touchstone-T", type=int, default=1)  # 你要的 T=1
+    p.add_argument("--fills", default="f0,csmean,ffill",
+                   help="comma list from {f0,csmean,ffill,csmin,csmax}")
+    p.add_argument("--lru-items", type=int, default=256, help="lazy fill cache size (columns*fill variants)")
+    return p.parse_args(argv)
+
+def main(argv: Optional[Sequence[str]]=None)->None:
+    args = parse_args(argv)
+    _log("\n==== New Session (MEMSAFE) =============================")
+    _log(f"Args: {vars(args)}")
+    path = os.path.expanduser(args.parquet_path)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Parquet not found: {path}")
+    with timeit("load.parquet", path=path):
+        df = pd.read_parquet(path)
+    df = ensure_mi(df)
+    fills = [x.strip() for x in args.fills.split(",") if x.strip()]
+    for f in fills:
+        if f not in VALID_FILLS:
+            raise ValueError(f"Unknown fill kind: {f}")
+    run(df=df,
+        iterations=args.iterations,
+        seed=args.seed,
+        log_path=args.log_path,
+        out_parquet=args.combo_parquet,
+        touchstone_state=args.touchstone_state,
+        touchstone_T=args.touchstone_T,
+        fills=fills,
+        lru_items=args.lru_items,
+    )
+
+if __name__ == "__main__":
+    main()
